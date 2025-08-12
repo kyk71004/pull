@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>좌석 예약 시스템 · MVP</title>
+  <!-- Tailwind CSS (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React / ReactDOM (CDN) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel for in-browser JSX transform -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gradient-to-br from-sky-50 to-emerald-50 min-h-screen">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo } = React;
+
+    const ZONE_COLORS = {
+      A: "bg-green-200 border-green-500",
+      B: "bg-blue-200 border-blue-500",
+      C: "bg-amber-200 border-amber-500",
+      U: "bg-gray-200 border-gray-400",
+    };
+    const defaultConfig = { rows: 6, cols: 10, zones: { A: 60000, B: 40000, C: 30000 } };
+    const STORAGE_KEY = "seat-reservations-v1";
+
+    function generateSeats(rows, cols) {
+      const seats = [];
+      for (let r = 1; r <= rows; r++) {
+        for (let c = 1; c <= cols; c++) {
+          seats.push({ id: `R${r}-C${c}`, row: r, col: c });
+        }
+      }
+      return seats;
+    }
+    const loadState = () => {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch {
+        return null;
+      }
+    };
+    const saveState = (state) => {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      } catch {}
+    };
+
+    function App() {
+      const saved = loadState();
+      const [config, setConfig] = useState(saved?.config || defaultConfig);
+      const [zoneMap, setZoneMap] = useState(saved?.zoneMap || {});
+      const [date, setDate] = useState(saved?.date || new Date().toISOString().slice(0, 10));
+      const [reservations, setReservations] = useState(saved?.reservations || {});
+      const [selection, setSelection] = useState([]);
+      const [mode, setMode] = useState("reserve");
+      const [form, setForm] = useState({ name: "", phone: "", notes: "" });
+
+      const seats = useMemo(() => generateSeats(config.rows, config.cols), [config]);
+      useEffect(() => saveState({ config, zoneMap, date, reservations }), [config, zoneMap, date, reservations]);
+
+      const dayBook = reservations[date] || {};
+      const cycleZone = (z) => (z === "U" || !z) ? "A" : z === "A" ? "B" : z === "B" ? "C" : "U";
+      const priceForSeat = (sid) => config.zones[zoneMap[sid] || "U"] || 0;
+      const isBooked = (sid) => Boolean(dayBook[sid]);
+
+      const toggleSelect = (sid) => {
+        if (mode === "assign") {
+          setZoneMap((prev) => ({ ...prev, [sid]: cycleZone(prev[sid] || "U") }));
+          return;
+        }
+        setSelection((prev) => prev.includes(sid) ? prev.filter((x) => x !== sid) : [...prev, sid]);
+      };
+      const clearSelection = () => setSelection([]);
+      const totalSelected = useMemo(() => selection.reduce((sum, id) => sum + priceForSeat(id), 0), [selection, zoneMap, config]);
+
+      const reserveSelected = (status = "confirmed") => {
+        if (selection.length === 0) return;
+        const stamp = new Date().toISOString();
+        setReservations((prev) => {
+          const copy = { ...prev };
+          const d = { ...(copy[date] || {}) };
+          selection.forEach((sid) => {
+            d[sid] = {
+              id: sid,
+              zone: zoneMap[sid] || "U",
+              price: priceForSeat(sid),
+              name: (form.name || "손님").trim(),
+              phone: (form.phone || "").trim(),
+              notes: (form.notes || "").trim(),
+              status,
+              createdAt: stamp,
+            };
+          });
+          copy[date] = d;
+          return copy;
+        });
+        clearSelection();
+        setForm({ name: "", phone: "", notes: "" });
+      };
+
+      const updateStatus = (sid, next) => {
+        setReservations((prev) => {
+          const copy = { ...prev };
+          const d = { ...(copy[date] || {}) };
+          if (d[sid]) d[sid] = { ...d[sid], status: next };
+          copy[date] = d;
+          return copy;
+        });
+      };
+      const cancelSeat = (sid) => {
+        setReservations((prev) => {
+          const copy = { ...prev };
+          const d = { ...(copy[date] || {}) };
+          delete d[sid];
+          copy[date] = d;
+          return copy;
+        });
+      };
+      const resetAll = () => {
+        if (!confirm("모든 설정과 예약을 초기화할까요?")) return;
+        setConfig(defaultConfig);
+        setZoneMap({});
+        setReservations({});
+        setSelection([]);
+      };
+      const exportCSV = () => {
+        const dbook = reservations[date] || {};
+        const rows = [
+          ["date", "seat", "zone", "price", "name", "phone", "status", "notes", "createdAt"],
+          ...Object.values(dbook).map((r) => [date, r.id, r.zone, r.price, r.name, r.phone, r.status, r.notes, r.createdAt]),
+        ];
+        const csv = rows.map((r) => r.map((x) => `"${String(x ?? "").replaceAll('"', '""')}"`).join(",")).join("\n");
+        const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `reservations_${date}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+      };
+
+      return (
+        <div className="p-4 md:p-8">
+          <h1 className="text-2xl font-bold mb-4">좌석 예약 시스템 · MVP</h1>
+          <div className="mb-4">
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="border p-2 rounded" />
+            <select value={mode} onChange={(e) => setMode(e.target.value)} className="border p-2 ml-2">
+              <option value="reserve">좌석 예약</option>
+              <option value="assign">구역 지정</option>
+            </select>
+            <button onClick={exportCSV} className="border px-2 py-1 ml-2">CSV 내보내기</button>
+            <button onClick={resetAll} className="border px-2 py-1 ml-2">초기화</button>
+          </div>
+          <div className="grid" style={{ gridTemplateColumns: `repeat(${config.cols}, minmax(0, 1fr))`, gap: "4px" }}>
+            {seats.map((s) => {
+              const z = zoneMap[s.id] || "U";
+              const booked = Boolean(dayBook[s.id]);
+              const selected = selection.includes(s.id);
+              return (
+                <button key={s.id} onClick={() => { if (booked && mode !== "assign") return; toggleSelect(s.id); }}
+                  className={`aspect-square rounded border ${ZONE_COLORS[z]} ${selected ? "ring-2 ring-emerald-500" : ""}`}>
+                  {s.id}
+                </button>
+              );
+            })}
+          </div>
+          <div className="mt-4">
+            <input placeholder="이름" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} className="border p-1 mr-2" />
+            <input placeholder="연락처" value={form.phone} onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))} className="border p-1 mr-2" />
+            <input placeholder="메모" value={form.notes} onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} className="border p-1 mr-2" />
+            <button onClick={() => reserveSelected("confirmed")} className="border px-2 py-1">예약 확정</button>
+          </div>
+          <h2 className="mt-4 font-bold">예약 목록</h2>
+          <ul>
+            {Object.values(dayBook).map((r) => (
+              <li key={r.id}>{r.id} - {r.name} ({r.status})
+                <button onClick={() => updateStatus(r.id, "paid")} className="ml-2 text-green-600">입금완료</button>
+                <button onClick={() => cancelSeat(r.id)} className="ml-2 text-red-600">취소</button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
