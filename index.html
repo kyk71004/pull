@@ -267,18 +267,25 @@
                 <input className="border rounded-xl p-2 mono" value={config.venueId} onChange={(e)=>setConfig(c=>({...c, venueId: e.target.value || "main"}))} />
               </div>
 
-              {online ? (
-                user ? (
-                  <div className="flex items-end gap-2">
-                    <div className="text-sm">로그인: <b>{user.email||user.uid}</b></div>
-                    <button className="px-3 py-2 rounded-xl bg-white border" onClick={()=>auth.signOut()}>로그아웃</button>
-                  </div>
-                ) : (
-                  <AuthForm />
-                )
-              ) : (
-                <div className="text-sm text-gray-600">Firebase 설정을 채우면 로그인 사용 가능</div>
-              )}
+{/* 항상 로그인 폼을 보여주고, 로그인되면 오른쪽에 상태만 표시 */}
+<div className="flex items-end gap-3">
+  {user ? (
+    <>
+      <div className="text-sm">로그인: <b>{user.email || user.uid}</b></div>
+      <button className="px-3 py-2 rounded-xl bg-white border" onClick={()=>auth.signOut()}>로그아웃</button>
+    </>
+  ) : (
+    <AuthForm />
+  )}
+
+  {/* 연결 상태는 안내만 (폼은 숨기지 않음) */}
+  {!online && (
+    <span className="text-xs px-2 py-1 rounded border bg-yellow-50 text-yellow-700">
+      Firebase 연결 대기…(입력 가능)
+    </span>
+  )}
+</div>
+
 
               <div className="ml-auto flex gap-2">
                 <button className="px-3 py-2 rounded-xl bg-white border" onClick={loadConfigFromServer}>설정 불러오기</button>
