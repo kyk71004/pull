@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>좌석 예약 시스템 · 관리자전용 좌석 + 수동 확정</title>
+  <title>좌석 예약 시스템 · 로그인/서버연동 + PIN</title>
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- React / ReactDOM -->
@@ -11,12 +11,13 @@
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <!-- Babel (in-browser JSX) -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Firebase (compat for simpler API) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
   <style>
     .seat:hover { transform: scale(1.03); }
-    .floating-bar {
-      position: fixed; left: 50%; transform: translateX(-50%);
-      bottom: 16px; transition: transform .25s ease, opacity .25s ease;
-    }
+    .floating-bar { position: fixed; left: 50%; transform: translateX(-50%); bottom: 16px; transition: transform .25s ease, opacity .25s ease; }
     .floating-enter { transform: translate(-50%, 100%); opacity: 0; }
     .floating-enter-show { transform: translate(-50%, 0%); opacity: 1; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace; }
@@ -28,211 +29,218 @@
   <script type="text/babel">
     const { useEffect, useMemo, useState } = React;
 
-    const ZONE_COLORS = {
-      A: "bg-green-200 border-green-500",
-      B: "bg-blue-200 border-blue-500",
-      C: "bg-amber-200 border-amber-500",
-      U: "bg-gray-200 border-gray-400",
+    // ---- Firebase Config (필수: 본인 프로젝트 값으로 교체) ----
+    // Firebase 콘솔 → 프로젝트 설정 → 내 앱 → SDK 설정 및 구성 복사
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+      projectId: "YOUR_PROJECT_ID",
+      // (선택) appId, storageBucket 등 필요시 추가
     };
+    const FIREBASE_READY = firebaseConfig.apiKey && !/YOUR_API_KEY/.test(firebaseConfig.apiKey);
 
+    let app = null, auth = null, db = null;
+    if (FIREBASE_READY) {
+      app = firebase.initializeApp(firebaseConfig);
+      auth = firebase.auth();
+      db = firebase.firestore();
+      // Firestore 권장: 한국 서버 리전은 도메인 기반, 리전 지정은 프로젝트 생성 시 설정
+    }
+
+    // ---- 기본 설정 ----
+    const ZONE_COLORS = { A: "bg-green-200 border-green-500", B: "bg-blue-200 border-blue-500", C: "bg-amber-200 border-amber-500", U: "bg-gray-200 border-gray-400" };
     const defaultConfig = {
       rows: 6, cols: 10,
       zones: { A: 60000, B: 40000, C: 30000 },
-      depositRate: 30,        // 계약금 비율 (%)
-      depositDeadlineH: 2,    // 입금 기한 (시간)
+      depositRate: 30,           // 계약금 비율 (%)
+      depositDeadlineH: 2,       // 입금 기한 (시간)
       bank: "국민은행", account: "123456-01-000000", holder: "옥돔역",
-      adminPin: "0000",       // 관리자 PIN (원하는 값으로 변경)
+      adminPin: "0000",         // 관리자 PIN
+      venueId: "main",          // 지점/공간 ID (경로 분리용)
     };
 
-    const STORAGE_KEY = "seat-reservations-v3"; // ← 버전업(관리자 전용 좌석 포함)
+    const STORAGE_KEY = "seat-reservations-srv-v1"; // 로컬 백업용
 
     const generateSeats = (rows, cols) => {
-      const seats = [];
-      for (let r=1; r<=rows; r++) for (let c=1; c<=cols; c++) seats.push({ id:`R${r}-C${c}`, row:r, col:c });
-      return seats;
+      const seats = []; for (let r=1; r<=rows; r++) for (let c=1; c<=cols; c++) seats.push({ id:`R${r}-C${c}`, row:r, col:c }); return seats;
     };
 
-    const loadState = () => { try { const raw = localStorage.getItem(STORAGE_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; } };
-    const saveState = (s) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch {} };
+    const fmtRemain = (ms) => { if (ms <= 0) return "만료"; const s=Math.floor(ms/1000), h=Math.floor(s/3600), m=Math.floor((s%3600)/60), ss=s%60; return `${h}시간 ${m}분 ${ss}초`; };
 
-    const fmtRemain = (ms) => {
-      if (ms <= 0) return "만료";
-      const totalSec = Math.floor(ms/1000);
-      const h = Math.floor(totalSec/3600);
-      const m = Math.floor((totalSec%3600)/60);
-      const s = totalSec%60;
-      return `${h}시간 ${m}분 ${s}초`;
-    };
+    // 로컬 스냅샷 저장/불러오기 (오프라인/백업)
+    const loadLocal = () => { try { const raw = localStorage.getItem(STORAGE_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; } };
+    const saveLocal = (state) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {} };
 
-    function App() {
-      const saved = loadState();
-      const [config, setConfig] = useState(saved?.config || defaultConfig);
-      const [zoneMap, setZoneMap] = useState(saved?.zoneMap || {});                 // seatId -> A/B/C/U
-      const [adminOnlyMap, setAdminOnlyMap] = useState(saved?.adminOnlyMap || {});  // seatId -> true(관리자 전용)
-      const [date, setDate] = useState(saved?.date || new Date().toISOString().slice(0,10));
-      const [reservations, setReservations] = useState(saved?.reservations || {});  // date -> seatId -> data
+    function App(){
+      const local = loadLocal();
+      const [config, setConfig] = useState(local?.config || defaultConfig);
+      const [zoneMap, setZoneMap] = useState(local?.zoneMap || {});          // seatId -> A/B/C/U
+      const [adminOnlyMap, setAdminOnlyMap] = useState(local?.adminOnlyMap || {}); // seatId -> true
+      const [date, setDate] = useState(local?.date || new Date().toISOString().slice(0,10));
+      const [reservations, setReservations] = useState(local?.reservations || {}); // date -> seatId -> data (로컬 캐시)
       const [selection, setSelection] = useState([]);
-      const [mode, setMode] = useState("reserve"); // reserve | assign
+      const [mode, setMode] = useState("reserve");
       const [adminMode, setAdminMode] = useState(false);
       const [form, setForm] = useState({ name:"", phone:"", notes:"" });
-      const [tick, setTick] = useState(Date.now()); // 타이머
-
+      const [tick, setTick] = useState(Date.now());
+      const [user, setUser] = useState(null);
+      const [online, setOnline] = useState(FIREBASE_READY); // Firebase 사용 여부
       const seats = useMemo(()=>generateSeats(config.rows, config.cols), [config.rows, config.cols]);
-      useEffect(()=>saveState({config, zoneMap, date, reservations, adminOnlyMap}), [config, zoneMap, date, reservations, adminOnlyMap]);
 
-      useEffect(()=>{ const t = setInterval(()=>setTick(Date.now()), 1000); return ()=>clearInterval(t); }, []);
+      // 로컬 백업 저장
+      useEffect(()=>saveLocal({config, zoneMap, adminOnlyMap, date, reservations}), [config, zoneMap, adminOnlyMap, date, reservations]);
+      // 타이머
+      useEffect(()=>{ const t=setInterval(()=>setTick(Date.now()),1000); return ()=>clearInterval(t); },[]);
+
+      // Firebase Auth 상태 감시
+      useEffect(()=>{
+        if (!online || !auth) return; const unsub = auth.onAuthStateChanged(u=>setUser(u)); return ()=>unsub&&unsub();
+      },[online]);
+
+      // Firestore 실시간 리스너 (날짜/venue 바뀔 때)
+      useEffect(()=>{
+        if (!online || !db || !user) return; // 로그인 필요
+        const path = db.collection('venues').doc(config.venueId).collection('dates').doc(date).collection('reservations');
+        const unsub = path.onSnapshot(snap => {
+          const dbook = {}; snap.forEach(doc=>{ dbook[doc.id] = doc.data(); });
+          setReservations(prev=>({ ...prev, [date]: dbook }));
+        });
+        return ()=>unsub&&unsub();
+      },[online, user, db, config.venueId, date]);
 
       const dayBook = reservations[date] || {};
       const cycleZone = (z) => (z==="U"||!z) ? "A" : z==="A" ? "B" : z==="B" ? "C" : "U";
       const priceForSeat = (sid) => config.zones[zoneMap[sid] || "U"] || 0;
-
       const isAdminOnly = (sid) => Boolean(adminOnlyMap[sid]);
       const toggleAdminOnly = (sid) => setAdminOnlyMap(prev => ({ ...prev, [sid]: !prev[sid] }));
 
       const toggleSelect = (sid, evt) => {
-        // 구역지정 모드 + Shift: 관리자 전용 토글
-        if (mode === "assign" && evt?.shiftKey) { toggleAdminOnly(sid); return; }
-
-        // 관리자 전용 좌석은 일반 모드에서 선택 불가
-        if (isAdminOnly(sid) && !adminMode && mode !== "assign") return;
-
-        if (mode === "assign") {
-          setZoneMap(prev=>({ ...prev, [sid]: cycleZone(prev[sid] || "U") }));
-          return;
-        }
+        if (mode === 'assign' && evt?.shiftKey) { toggleAdminOnly(sid); return; }
+        if (isAdminOnly(sid) && !adminMode && mode !== 'assign') return;
+        if (mode === 'assign') { setZoneMap(prev=>({ ...prev, [sid]: cycleZone(prev[sid] || 'U') })); return; }
         setSelection(prev => prev.includes(sid) ? prev.filter(x=>x!==sid) : [...prev, sid]);
       };
-
       const clearSelection = () => setSelection([]);
       const totalSelected = useMemo(()=>selection.reduce((s,id)=>s+priceForSeat(id),0), [selection, zoneMap, config.zones]);
 
-      // 고객 안내문
-      const buildNotice = (sum, deposit, dueAtISO) => {
-        const d = new Date(dueAtISO);
-        const dueStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
-        return [
-          `[옥돔역 좌석 예약 안내]`,
-          `총 금액: ${sum.toLocaleString()}원`,
-          `계약금(${config.depositRate}%): ${deposit.toLocaleString()}원`,
-          `입금 계좌: ${config.bank} ${config.account} (${config.holder})`,
-          `입금 기한: ${dueStr} 까지`,
-          ``,
-          `※ 기한 내 미입금 시 자동 취소될 수 있습니다.`,
-        ].join("\n");
-      };
-      const copyText = async (txt) => {
-        try { await navigator.clipboard.writeText(txt); alert("안내문이 복사되었습니다."); }
-        catch { alert("복사에 실패했습니다. 수동으로 복사해주세요."); }
+      // 공통 예약 데이터 생성
+      const buildReservationPayload = (sid, stamp) => {
+        const sum = totalSelected; const deposit = Math.round(sum * (config.depositRate/100));
+        const dueAt = new Date(stamp.getTime() + config.depositDeadlineH*3600*1000).toISOString();
+        return {
+          id: sid, zone: zoneMap[sid] || 'U', price: priceForSeat(sid),
+          name: (form.name||'손님').trim(), phone: (form.phone||'').trim(), notes: (form.notes||'').trim(),
+          status: '입금대기', total: sum, deposit, createdAt: stamp.toISOString(), dueAt,
+          bank: config.bank, account: config.account, holder: config.holder, depositRate: config.depositRate,
+          adminOnly: isAdminOnly(sid),
+          by: user ? (user.email || user.uid) : 'local'
+        };
       };
 
-      // 예약 생성: 입금대기
-      const createPending = () => {
-        if (selection.length === 0) return;
-        const stamp = new Date();
-        const sum = totalSelected;
-        const deposit = Math.round(sum * (config.depositRate/100));
-        const dueAt = new Date(stamp.getTime() + config.depositDeadlineH * 3600 * 1000).toISOString();
-
-        setReservations(prev=>{
-          const copy = {...prev};
-          const d = {...(copy[date] || {})};
-          selection.forEach(sid=>{
-            d[sid] = {
-              id: sid,
-              zone: zoneMap[sid] || "U",
-              price: priceForSeat(sid),
-              name: (form.name || "손님").trim(),
-              phone: (form.phone || "").trim(),
-              notes: (form.notes || "").trim(),
-              status: "입금대기",
-              total: sum,
-              deposit,
-              createdAt: stamp.toISOString(),
-              dueAt,
-              bank: config.bank,
-              account: config.account,
-              holder: config.holder,
-              depositRate: config.depositRate,
-              adminOnly: isAdminOnly(sid),
-            };
-          });
-          copy[date] = d;
-          return copy;
-        });
+      // 입금대기 생성 (온라인: Firestore, 오프라인: 로컬)
+      const createPending = async () => {
+        if (selection.length===0) return; const stamp = new Date();
+        if (online && db && user) {
+          const col = db.collection('venues').doc(config.venueId).collection('dates').doc(date).collection('reservations');
+          const batch = db.batch();
+          selection.forEach(sid=>{ const ref = col.doc(sid); batch.set(ref, buildReservationPayload(sid, stamp), { merge: false }); });
+          await batch.commit().catch(err=>alert('저장 오류: '+err.message));
+        } else {
+          setReservations(prev=>{ const copy={...prev}; const d={...(copy[date]||{})}; selection.forEach(sid=>{ d[sid] = buildReservationPayload(sid, stamp); }); copy[date]=d; return copy; });
+        }
         clearSelection();
       };
 
-      // 상태 변경/취소/만료
-      const updateStatus = (sid, next) => {
-        setReservations(prev=>{
-          const copy = {...prev};
-          const d = {...(copy[date] || {})};
-          if (d[sid]) d[sid] = { ...d[sid], status: next };
-          copy[date] = d;
-          return copy;
-        });
-      };
-      const cancelSeat = (sid) => {
-        setReservations(prev=>{
-          const copy = {...prev};
-          const d = {...(copy[date] || {})};
-          delete d[sid];
-          copy[date] = d;
-          return copy;
-        });
-      };
-      const markExpiredIfOverdue = (sid) => {
-        setReservations(prev=>{
-          const copy = {...prev};
-          const d = {...(copy[date] || {})};
-          const r = d[sid];
-          if (r) {
-            const overdue = Date.now() > new Date(r.dueAt).getTime();
-            if (overdue && r.status === "입금대기") d[sid] = { ...r, status: "만료" };
-          }
-          copy[date] = d;
-          return copy;
-        });
+      const updateStatus = async (sid, next) => {
+        if (online && db && user) {
+          const ref = db.collection('venues').doc(config.venueId).collection('dates').doc(date).collection('reservations').doc(sid);
+          await ref.set({ status: next }, { merge: true }).catch(err=>alert('업데이트 오류: '+err.message));
+        } else {
+          setReservations(prev=>{ const copy={...prev}; const d={...(copy[date]||{})}; if (d[sid]) d[sid] = { ...d[sid], status: next }; copy[date]=d; return copy; });
+        }
       };
 
-      // CSV
-      const exportCSV = () => {
-        const dbook = reservations[date] || {};
-        const rows = [
-          ["date","seat","zone","price","name","phone","status","total","deposit","createdAt","dueAt","bank","account","holder","adminOnly","notes"],
-          ...Object.values(dbook).map(r=>[
-            date,r.id,r.zone,r.price,r.name,r.phone,r.status,r.total||"",r.deposit||"",r.createdAt||"",r.dueAt||"",r.bank||"",r.account||"",r.holder||"",r.adminOnly?"Y":"",r.notes||""
-          ])
-        ];
-        const csv = rows.map(r=>r.map(x=>`"${String(x??"").replaceAll('"','""')}"`).join(",")).join("\n");
-        const blob = new Blob(["\uFEFF"+csv], { type:"text/csv;charset=utf-8;" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a"); a.href = url; a.download = `reservations_${date}.csv`; a.click();
-        URL.revokeObjectURL(url);
+      const cancelSeat = async (sid) => {
+        if (online && db && user) {
+          const ref = db.collection('venues').doc(config.venueId).collection('dates').doc(date).collection('reservations').doc(sid);
+          await ref.delete().catch(err=>alert('삭제 오류: '+err.message));
+        } else {
+          setReservations(prev=>{ const copy={...prev}; const d={...(copy[date]||{})}; delete d[sid]; copy[date]=d; return copy; });
+        }
       };
+
+      const markExpiredIfOverdue = async (sid) => {
+        const r = dayBook[sid]; if (!r) return; const overdue = Date.now() > new Date(r.dueAt||0).getTime(); if (!overdue) return alert('아직 기한이 지나지 않았습니다.');
+        await updateStatus(sid, '만료');
+      };
+
+      const exportCSV = () => {
+        const dbook = reservations[date] || {}; const rows = [["date","seat","zone","price","name","phone","status","total","deposit","createdAt","dueAt","bank","account","holder","adminOnly","notes","by"], ...Object.values(dbook).map(r=>[date,r.id,r.zone,r.price,r.name,r.phone,r.status,r.total||"",r.deposit||"",r.createdAt||"",r.dueAt||"",r.bank||"",r.account||"",r.holder||"",r.adminOnly?"Y":"",r.notes||"",r.by||""])];
+        const csv = rows.map(r=>r.map(x=>`"${String(x??"").replaceAll('"','""')}"`).join(",")).join("\n");
+        const blob = new Blob(["\uFEFF"+csv], { type:"text/csv;charset=utf-8;" }); const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=`reservations_${date}.csv`; a.click(); URL.revokeObjectURL(url);
+      };
+
+      const saveConfigToServer = async () => {
+        if (!online || !db || !user) return alert('로그인 후 이용하세요.');
+        const ref = db.collection('venues').doc(config.venueId).collection('config').doc('default');
+        await ref.set({ ...config, zoneMap, adminOnlyMap, updatedAt: new Date().toISOString(), by: user.email||user.uid }, { merge: true }).then(()=>alert('설정 저장 완료')).catch(err=>alert('설정 저장 오류: '+err.message));
+      };
+      const loadConfigFromServer = async () => {
+        if (!online || !db || !user) return alert('로그인 후 이용하세요.');
+        const ref = db.collection('venues').doc(config.venueId).collection('config').doc('default');
+        const snap = await ref.get(); if (snap.exists) {
+          const data = snap.data();
+          setConfig(prev=>({ ...prev, ...['rows','cols','zones','depositRate','depositDeadlineH','bank','account','holder','adminPin','venueId'].reduce((o,k)=>{ if (data[k]!==undefined) o[k]=data[k]; return o; },{}) }));
+          if (data.zoneMap) setZoneMap(data.zoneMap);
+          if (data.adminOnlyMap) setAdminOnlyMap(data.adminOnlyMap);
+          alert('설정 불러오기 완료');
+        } else {
+          alert('서버에 저장된 설정이 없습니다.');
+        }
+      };
+
+      const buildNotice = (sum, deposit, dueAtISO) => { const d=new Date(dueAtISO); const dueStr=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`; return [`[옥돔역 좌석 예약 안내]`,`총 금액: ${sum.toLocaleString()}원`,`계약금(${config.depositRate}%): ${deposit.toLocaleString()}원`,`입금 계좌: ${config.bank} ${config.account} (${config.holder})`,`입금 기한: ${dueStr} 까지`,``,`※ 기한 내 미입금 시 자동 취소될 수 있습니다.`].join("\n"); };
+      const copyText = async (txt) => { try { await navigator.clipboard.writeText(txt); alert('안내문이 복사되었습니다.'); } catch { alert('복사에 실패했습니다. 수동 복사해주세요.'); } };
 
       return (
         <div className="p-4 md:p-8">
           <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6">
             {/* 헤더 */}
-            <div className="lg:col-span-3 flex items-center justify-between">
+            <div className="lg:col-span-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
               <div>
                 <h1 className="text-2xl md:text-3xl font-bold">좌석 예약 시스템</h1>
-                <p className="text-sm text-gray-600 mt-1">관리자 전용 좌석 + 수동 확정(계약금) · 로컬 저장 · CSV 내보내기</p>
+                <p className="text-sm text-gray-600 mt-1">로그인/서버 연동 + 관리자 전용 좌석 + 수동 확정(계약금)</p>
               </div>
-              <div className="flex gap-2">
-                <button
-                  className={"px-3 py-2 rounded-2xl shadow " + (adminMode ? "bg-emerald-600 text-white" : "bg-white hover:bg-gray-50")}
-                  onClick={()=>{
-                    if (adminMode) { setAdminMode(false); return; }
-                    const pin = prompt("관리자 PIN을 입력하세요");
-                    if (pin === config.adminPin) setAdminMode(true);
-                    else alert("PIN이 올바르지 않습니다.");
-                  }}
-                >
-                  {adminMode ? "관리자 모드 ON" : "관리자 모드"}
-                </button>
+              <div className="flex flex-wrap items-center gap-2">
+                {!online && (
+                  <span className="px-3 py-2 rounded-2xl bg-yellow-100 text-yellow-800 text-sm">Firebase 미설정: 로컬 모드</span>
+                )}
+                <button className={"px-3 py-2 rounded-2xl shadow "+(adminMode?"bg-emerald-600 text-white":"bg-white hover:bg-gray-50")} onClick={()=>{ if (adminMode) { setAdminMode(false); return; } const pin = prompt('관리자 PIN을 입력하세요'); if (pin===config.adminPin) setAdminMode(true); else alert('PIN이 올바르지 않습니다.'); }}>{adminMode?"관리자 모드 ON":"관리자 모드"}</button>
                 <button className="px-3 py-2 rounded-2xl shadow bg-white hover:bg-gray-50" onClick={exportCSV}>CSV 내보내기</button>
+              </div>
+            </div>
+
+            {/* 로그인/프로젝트 설정 바 */}
+            <div className="lg:col-span-3 bg-white rounded-2xl shadow p-4 flex flex-wrap items-end gap-3">
+              <div>
+                <div className="text-xs text-gray-500">지점/공간 ID (venueId)</div>
+                <input className="border rounded-xl p-2 mono" value={config.venueId} onChange={(e)=>setConfig(c=>({...c, venueId: e.target.value || 'main'}))} />
+              </div>
+              {online ? (
+                user ? (
+                  <div className="flex items-end gap-2">
+                    <div className="text-sm">로그인: <b>{user.email||user.uid}</b></div>
+                    <button className="px-3 py-2 rounded-xl bg-white border" onClick={()=>auth.signOut()}>로그아웃</button>
+                  </div>
+                ) : (
+                  <AuthForm />
+                )
+              ) : (
+                <div className="text-sm text-gray-600">Firebase 설정을 채워 넣으면 로그인 사용 가능</div>
+              )}
+              <div className="ml-auto flex gap-2">
+                <button className="px-3 py-2 rounded-xl bg-white border" onClick={loadConfigFromServer}>설정 불러오기</button>
+                <button className="px-3 py-2 rounded-xl bg-white border" onClick={saveConfigToServer}>설정 저장</button>
               </div>
             </div>
 
@@ -245,15 +253,11 @@
                 <div className="grid grid-cols-3 gap-3 mt-4">
                   <div>
                     <label className="block text-xs text-gray-500">행(Rows)</label>
-                    <input type="number" min="1" value={config.rows}
-                      onChange={(e)=>setConfig(c=>({...c, rows: Math.max(1, Number(e.target.value))}))}
-                      className="mt-1 w-full rounded-xl border p-2" />
+                    <input type="number" min="1" value={config.rows} onChange={(e)=>setConfig(c=>({...c, rows: Math.max(1, Number(e.target.value))}))} className="mt-1 w-full rounded-xl border p-2" />
                   </div>
                   <div>
                     <label className="block text-xs text-gray-500">열(Cols)</label>
-                    <input type="number" min="1" value={config.cols}
-                      onChange={(e)=>setConfig(c=>({...c, cols: Math.max(1, Number(e.target.value))}))}
-                      className="mt-1 w-full rounded-xl border p-2" />
+                    <input type="number" min="1" value={config.cols} onChange={(e)=>setConfig(c=>({...c, cols: Math.max(1, Number(e.target.value))}))} className="mt-1 w-full rounded-xl border p-2" />
                   </div>
                   <div>
                     <label className="block text-xs text-gray-500">모드</label>
@@ -264,34 +268,26 @@
                   </div>
                 </div>
 
-                {/* 구역 가격 */}
                 <div className="mt-4 grid grid-cols-3 gap-3">
-                  {["A","B","C"].map(z=>(
+                  {["A","B","C"].map(z=> (
                     <div key={z} className="bg-gray-50 rounded-xl p-3">
                       <div className="text-xs text-gray-500">구역 {z} 가격</div>
-                      <input type="number" min="0" value={config.zones[z]}
-                        onChange={(e)=>setConfig(c=>({...c, zones:{...c.zones, [z]: Number(e.target.value)}}))}
-                        className="mt-1 w-full rounded-xl border p-2" />
+                      <input type="number" min="0" value={config.zones[z]} onChange={(e)=>setConfig(c=>({...c, zones:{...c.zones, [z]: Number(e.target.value)}}))} className="mt-1 w-full rounded-xl border p-2" />
                     </div>
                   ))}
                 </div>
 
-                {/* 계약금/기한/계좌 */}
+                {/* 계약금/기한/계좌/PIN */}
                 <div className="mt-4 grid grid-cols-2 gap-3">
                   <div>
                     <div className="text-xs text-gray-500">계약금 비율(%)</div>
-                    <input type="number" min="0" max="100" value={config.depositRate}
-                      onChange={(e)=>setConfig(c=>({...c, depositRate: Math.max(0, Math.min(100, Number(e.target.value)))}))}
-                      className="mt-1 w-full rounded-xl border p-2" />
+                    <input type="number" min="0" max="100" value={config.depositRate} onChange={(e)=>setConfig(c=>({...c, depositRate: Math.max(0, Math.min(100, Number(e.target.value)))}))} className="mt-1 w-full rounded-xl border p-2" />
                   </div>
                   <div>
                     <div className="text-xs text-gray-500">입금 기한(시간)</div>
-                    <input type="number" min="0.5" step="0.5" value={config.depositDeadlineH}
-                      onChange={(e)=>setConfig(c=>({...c, depositDeadlineH: Math.max(0.5, Number(e.target.value))}))}
-                      className="mt-1 w-full rounded-xl border p-2" />
+                    <input type="number" min="0.5" step="0.5" value={config.depositDeadlineH} onChange={(e)=>setConfig(c=>({...c, depositDeadlineH: Math.max(0.5, Number(e.target.value))}))} className="mt-1 w-full rounded-xl border p-2" />
                   </div>
                 </div>
-
                 <div className="mt-3 grid grid-cols-3 gap-3">
                   <div>
                     <div className="text-xs text-gray-500">은행</div>
@@ -299,12 +295,12 @@
                   </div>
                   <div className="col-span-2">
                     <div className="text-xs text-gray-500">계좌번호 / 예금주</div>
-                    <input value={`${config.account} / ${config.holder}`} onChange={(e)=>{
-                      const [acc, ...rest] = e.target.value.split("/");
-                      const holder = (rest.join("/")).trim();
-                      setConfig(c=>({...c, account:(acc||"").trim(), holder: holder || c.holder }));
-                    }} className="mt-1 w-full rounded-xl border p-2 mono" />
+                    <input value={`${config.account} / ${config.holder}`} onChange={(e)=>{ const [acc,...rest]=e.target.value.split('/'); const holder=(rest.join('/')).trim(); setConfig(c=>({...c, account:(acc||'').trim(), holder: holder || c.holder })); }} className="mt-1 w-full rounded-xl border p-2 mono" />
                   </div>
+                </div>
+                <div className="mt-3">
+                  <div className="text-xs text-gray-500">관리자 PIN</div>
+                  <input type="password" value={config.adminPin} onChange={(e)=>setConfig(c=>({...c, adminPin: e.target.value}))} className="mt-1 w-full rounded-xl border p-2 mono" placeholder="숫자 4자리 권장" />
                 </div>
 
                 <div className="mt-4 flex items-center gap-2 text-sm">
@@ -318,20 +314,13 @@
               {/* 예약자 정보 */}
               <div className="bg-white rounded-2xl shadow p-4 space-y-3">
                 <h2 className="font-semibold">예약자 정보</h2>
-                <input placeholder="이름" value={form.name} onChange={(e)=>setForm(f=>({...f, name:e.target.value}))}
-                       className="w-full rounded-xl border p-2" />
-                <input placeholder="연락처" value={form.phone} onChange={(e)=>setForm(f=>({...f, phone:e.target.value}))}
-                       className="w-full rounded-xl border p-2" />
-                <textarea placeholder="메모" rows="2" value={form.notes} onChange={(e)=>setForm(f=>({...f, notes:e.target.value}))}
-                          className="w-full rounded-xl border p-2"></textarea>
-                <div className="text-sm text-gray-600">
-                  선택 좌석: <b>{selection.length}</b>개 · 합계 <b>{(selection.reduce((s,id)=>s+priceForSeat(id),0)).toLocaleString()}</b>원
-                </div>
+                <input placeholder="이름" value={form.name} onChange={(e)=>setForm(f=>({...f, name:e.target.value}))} className="w-full rounded-xl border p-2" />
+                <input placeholder="연락처" value={form.phone} onChange={(e)=>setForm(f=>({...f, phone:e.target.value}))} className="w-full rounded-xl border p-2" />
+                <textarea placeholder="메모" rows="2" value={form.notes} onChange={(e)=>setForm(f=>({...f, notes:e.target.value}))} className="w-full rounded-xl border p-2"></textarea>
+                <div className="text-sm text-gray-600">선택 좌석: <b>{selection.length}</b>개 · 합계 <b>{(selection.reduce((s,id)=>s+priceForSeat(id),0)).toLocaleString()}</b>원</div>
                 <div className="flex gap-2">
-                  <button disabled={selection.length===0} onClick={createPending}
-                          className="px-3 py-2 rounded-2xl shadow bg-amber-500 text-white disabled:opacity-40">입금대기 생성</button>
-                  <button onClick={()=>setForm({name:"",phone:"",notes:""})}
-                          className="px-3 py-2 rounded-2xl shadow bg-white">입력 초기화</button>
+                  <button disabled={selection.length===0} onClick={createPending} className="px-3 py-2 rounded-2xl shadow bg-amber-500 text-white disabled:opacity-40">입금대기 생성</button>
+                  <button onClick={()=>setForm({name:'',phone:'',notes:''})} className="px-3 py-2 rounded-2xl shadow bg-white">입력 초기화</button>
                 </div>
               </div>
             </div>
@@ -340,13 +329,11 @@
             <div className="lg:col-span-2 bg-white rounded-2xl shadow p-4">
               <div className="flex items-center justify-between mb-3">
                 <h2 className="font-semibold">좌석 배치</h2>
-                <div className="text-sm text-gray-600">
-                  클릭: {mode==="assign" ? "구역 순환(A→B→C→미지정), Shift+클릭: 관리자전용(🔒) 토글" : "좌석 선택/해제"}
-                </div>
+                <div className="text-sm text-gray-600">클릭: {mode==='assign' ? '구역 순환(A→B→C→미지정), Shift+클릭: 관리자전용(🔒) 토글' : '좌석 선택/해제'}</div>
               </div>
-              <div className="grid" style={{ gridTemplateColumns: `repeat(${config.cols}, minmax(0, 1fr))`, gap: "8px" }}>
+              <div className="grid" style={{ gridTemplateColumns: `repeat(${config.cols}, minmax(0, 1fr))`, gap: '8px' }}>
                 {seats.map(s=>{
-                  const z = zoneMap[s.id] || "U";
+                  const z = zoneMap[s.id] || 'U';
                   const booked = Boolean(dayBook[s.id]);
                   const selected = selection.includes(s.id);
                   const adminOnly = isAdminOnly(s.id);
@@ -354,24 +341,17 @@
                     <button key={s.id}
                       onClick={(e)=>{ if (booked && mode!=="assign") return; toggleSelect(s.id, e); }}
                       className={[
-                        "seat relative aspect-square rounded-xl border flex items-center justify-center text-xs md:text-sm select-none transition",
+                        'seat relative aspect-square rounded-xl border flex items-center justify-center text-xs md:text-sm select-none transition',
                         ZONE_COLORS[z],
-                        (booked && mode!=="assign") ? "opacity-50 cursor-not-allowed" : "",
-                        (adminOnly && !adminMode && mode!=="assign") ? "opacity-50 cursor-not-allowed" : "",
-                        selected ? "ring-2 ring-emerald-500" : ""
-                      ].join(" ")}
-                      title={`${s.id} · 구역 ${z}${booked ? " · 예약됨" : ""}${adminOnly ? " · 관리자전용" : ""}`}
+                        (booked && mode!=="assign") ? 'opacity-50 cursor-not-allowed' : '',
+                        (adminOnly && !adminMode && mode!=="assign") ? 'opacity-50 cursor-not-allowed' : '',
+                        selected ? 'ring-2 ring-emerald-500' : ''
+                      ].join(' ')}
+                      title={`${s.id} · 구역 ${z}${booked ? ' · 예약됨' : ''}${adminOnly ? ' · 관리자전용' : ''}`}
                     >
                       <div className="text-gray-800 font-medium">{s.id}</div>
-                      <div className="absolute bottom-1 right-1 text-[10px] bg-white/70 px-1 rounded">
-                        {priceForSeat(s.id).toLocaleString()}원
-                      </div>
-
-                      {/* 관리자 전용 배지 */}
-                      {adminOnly && (
-                        <div className="absolute top-1 left-1 text-[10px] bg-gray-800 text-white px-1 rounded">🔒</div>
-                      )}
-
+                      <div className="absolute bottom-1 right-1 text-[10px] bg-white/70 px-1 rounded">{priceForSeat(s.id).toLocaleString()}원</div>
+                      {adminOnly && <div className="absolute top-1 left-1 text-[10px] bg-gray-800 text-white px-1 rounded">🔒</div>}
                       {(booked && mode!=="assign") && <div className="absolute inset-0 rounded-xl bg-black/10"></div>}
                     </button>
                   );
@@ -386,7 +366,6 @@
                   <h2 className="font-semibold">예약 목록 · {date}</h2>
                   <div className="text-sm text-gray-500">총 {Object.keys(dayBook).length}석</div>
                 </div>
-
                 <div className="overflow-x-auto">
                   <table className="min-w-full text-sm">
                     <thead>
@@ -406,12 +385,9 @@
                       </tr>
                     </thead>
                     <tbody>
-                      {Object.values(dayBook).length === 0 && (
-                        <tr><td colSpan="12" className="p-6 text-center text-gray-500">아직 예약이 없습니다.</td></tr>
-                      )}
-                      {Object.values(dayBook).sort((a,b)=>a.id.localeCompare(b.id)).map((r)=>{
-                        const dueMs = r.dueAt ? new Date(r.dueAt).getTime() - tick : 0;
-                        const remain = r.status==="입금대기" ? fmtRemain(dueMs) : (r.status==="만료" ? "만료" : "-");
+                      {Object.values(dayBook).length===0 && (<tr><td colSpan="12" className="p-6 text-center text-gray-500">아직 예약이 없습니다.</td></tr>)}
+                      {Object.values(dayBook).sort((a,b)=>a.id.localeCompare(b.id)).map(r=>{
+                        const dueMs = r.dueAt ? (new Date(r.dueAt).getTime() - tick) : 0; const remain = r.status==='입금대기' ? fmtRemain(dueMs) : (r.status==='만료' ? '만료' : '-');
                         return (
                           <tr key={r.id} className="border-t align-top">
                             <td className="p-2 font-medium">{r.id}</td>
@@ -420,38 +396,26 @@
                             <td className="p-2">{r.name}</td>
                             <td className="p-2">{r.phone}</td>
                             <td className="p-2">
-                              <span className={[
-                                "px-2 py-1 rounded-full text-xs",
-                                r.status==="입금대기" ? "bg-yellow-100 text-yellow-800" :
-                                r.status==="확정" ? "bg-blue-100 text-blue-700" :
-                                r.status==="만료" ? "bg-gray-200 text-gray-700" :
-                                r.status==="취소" ? "bg-gray-200 text-gray-700" :
-                                "bg-emerald-100 text-emerald-700"
-                              ].join(" ")}>{r.status}</span>
+                              <span className={['px-2 py-1 rounded-full text-xs', r.status==='입금대기'?'bg-yellow-100 text-yellow-800': r.status==='확정'?'bg-blue-100 text-blue-700': r.status==='만료'?'bg-gray-200 text-gray-700': r.status==='취소'?'bg-gray-200 text-gray-700':'bg-emerald-100 text-emerald-700'].join(' ')}>{r.status}</span>
                             </td>
                             <td className="p-2 text-right">{(r.deposit||0).toLocaleString()}원</td>
-                            <td className="p-2">{r.dueAt ? new Date(r.dueAt).toLocaleString() : "-"}</td>
+                            <td className="p-2">{r.dueAt ? new Date(r.dueAt).toLocaleString() : '-'}</td>
                             <td className="p-2">{remain}</td>
                             <td className="p-2 max-w-[220px] truncate" title={r.notes}>{r.notes}</td>
-                            <td className="p-2">{r.adminOnly ? "🔒" : "-"}</td>
+                            <td className="p-2">{r.adminOnly ? '🔒' : '-'}</td>
                             <td className="p-2">
                               <div className="flex flex-col gap-1 items-end">
-                                {r.status==="입금대기" && (
+                                {r.status==='입금대기' && (
                                   <>
-                                    <button className="px-2 py-1 rounded-xl bg-white border"
-                                      onClick={()=>updateStatus(r.id,"확정")}>입금확인→확정</button>
-                                    <button className="px-2 py-1 rounded-xl bg-white border"
-                                      onClick={()=>{ markExpiredIfOverdue(r.id); }}>만료 처리</button>
-                                    <button className="px-2 py-1 rounded-xl bg-white border"
-                                      onClick={()=>copyText(buildNotice(r.total||0, r.deposit||0, r.dueAt))}>안내문 복사</button>
+                                    <button className="px-2 py-1 rounded-xl bg-white border" onClick={()=>updateStatus(r.id,'확정')}>입금확인→확정</button>
+                                    <button className="px-2 py-1 rounded-xl bg-white border" onClick={()=>markExpiredIfOverdue(r.id)}>만료 처리</button>
+                                    <button className="px-2 py-1 rounded-xl bg-white border" onClick={()=>copyText(buildNotice(r.total||0, r.deposit||0, r.dueAt))}>안내문 복사</button>
                                   </>
                                 )}
-                                {r.status!=="취소" && (
-                                  <button className="px-2 py-1 rounded-xl bg-white border text-red-600"
-                                    onClick={()=>updateStatus(r.id,"취소")}>취소</button>
+                                {r.status!=='취소' && (
+                                  <button className="px-2 py-1 rounded-xl bg-white border text-red-600" onClick={()=>updateStatus(r.id,'취소')}>취소</button>
                                 )}
-                                <button className="px-2 py-1 rounded-xl bg-white border"
-                                  onClick={()=>cancelSeat(r.id)}>행 제거</button>
+                                <button className="px-2 py-1 rounded-xl bg-white border" onClick={()=>cancelSeat(r.id)}>행 제거</button>
                               </div>
                             </td>
                           </tr>
@@ -467,18 +431,19 @@
                 <div className="bg-white rounded-2xl shadow p-4">
                   <h3 className="font-semibold mb-2">운영 흐름</h3>
                   <ol className="list-decimal pl-5 space-y-1 text-sm text-gray-700">
-                    <li>좌석 구역 지정(A/B/C) 및 가격 입력</li>
-                    <li>관리자 전용 좌석: <b>모드=구역 지정</b>에서 <b>Shift+클릭</b>으로 토글(🔒)</li>
+                    <li>로그인(이메일/비번) → venueId 확인</li>
+                    <li>좌석 구역(A/B/C) 지정 + 가격 입력</li>
+                    <li>관리자전용 좌석: <b>모드=구역 지정</b>에서 <b>Shift+클릭</b>으로 토글(🔒)</li>
                     <li>날짜 선택 → 좌석 선택 → 예약자 정보 → <b>입금대기 생성</b></li>
                     <li>입금 확인 후 <b>입금확인→확정</b>, 기한 경과 시 <b>만료 처리</b></li>
                   </ol>
                 </div>
                 <div className="bg-white rounded-2xl shadow p-4">
-                  <h3 className="font-semibold mb-2">팁</h3>
+                  <h3 className="font-semibold mb-2">참고</h3>
                   <ul className="list-disc pl-5 space-y-1 text-sm text-gray-700">
-                    <li><b>관리자 모드</b> 버튼으로 PIN 입력 후 관리자 전용 좌석도 예약 가능</li>
-                    <li>안내문 복사: 금액·계좌·기한 포함 메시지를 바로 고객에게 전송</li>
-                    <li>데이터는 브라우저에 저장됩니다. PC 변경 시 CSV 백업 권장</li>
+                    <li>Firebase 미설정 시 로컬 모드로 동작(데이터는 이 PC 브라우저에 저장)</li>
+                    <li>설정을 서버에 저장/불러오기로 스태프 간 공유 가능</li>
+                    <li>중복 방지 강화를 위해 예약 생성 시 트랜잭션 적용을 권장(필요 시 확장)</li>
                   </ul>
                 </div>
               </div>
@@ -486,19 +451,36 @@
           </div>
 
           {/* 하단 선택 바 */}
-          <div className={
-            "floating-bar bg-white shadow-lg rounded-2xl px-4 py-3 flex items-center gap-4 border " +
-            (selection.length>0 ? "floating-enter-show" : "floating-enter")
-          }>
+          <div className={"floating-bar bg-white shadow-lg rounded-2xl px-4 py-3 flex items-center gap-4 border "+(selection.length>0?"floating-enter-show":"floating-enter") }>
             <div className="text-sm">선택 {selection.length}석 · 합계 <b>{totalSelected.toLocaleString()}</b>원</div>
             <button onClick={createPending} className="px-3 py-2 rounded-xl bg-amber-500 text-white">입금대기 생성</button>
             <button onClick={clearSelection} className="px-3 py-2 rounded-xl bg-white border">선택 해제</button>
           </div>
         </div>
       );
+
+      function AuthForm(){
+        const [email, setEmail] = useState("");
+        const [pw, setPw] = useState("");
+        if (!auth) return null;
+        return (
+          <div className="flex items-end gap-2">
+            <div>
+              <div className="text-xs text-gray-500">이메일</div>
+              <input className="border rounded-xl p-2" value={email} onChange={e=>setEmail(e.target.value)} placeholder="staff@example.com" />
+            </div>
+            <div>
+              <div className="text-xs text-gray-500">비밀번호</div>
+              <input type="password" className="border rounded-xl p-2" value={pw} onChange={e=>setPw(e.target.value)} />
+            </div>
+            <button className="px-3 py-2 rounded-xl bg-white border" onClick={()=>auth.signInWithEmailAndPassword(email, pw).catch(e=>alert(e.message))}>로그인</button>
+            <button className="px-3 py-2 rounded-xl bg-white border" onClick={()=>auth.createUserWithEmailAndPassword(email, pw).catch(e=>alert(e.message))}>회원가입</button>
+          </div>
+        );
+      }
     }
 
-    const root = ReactDOM.createRoot(document.getElementById("root"));
+    const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(<App />);
   </script>
 </body>
