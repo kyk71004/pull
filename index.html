@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>좌석 예약 시스템 · 수동 확정 버전</title>
+  <title>좌석 예약 시스템 · 관리자전용 좌석 + 수동 확정</title>
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- React / ReactDOM -->
@@ -34,24 +34,27 @@
       C: "bg-amber-200 border-amber-500",
       U: "bg-gray-200 border-gray-400",
     };
+
     const defaultConfig = {
       rows: 6, cols: 10,
       zones: { A: 60000, B: 40000, C: 30000 },
       depositRate: 30,        // 계약금 비율 (%)
       depositDeadlineH: 2,    // 입금 기한 (시간)
-      bank: "국민은행", account: "123456-01-000000", holder: "옥돔역"
+      bank: "국민은행", account: "123456-01-000000", holder: "옥돔역",
+      adminPin: "0000",       // 관리자 PIN (원하는 값으로 변경)
     };
-    const STORAGE_KEY = "seat-reservations-v2"; // 버전 업
+
+    const STORAGE_KEY = "seat-reservations-v3"; // ← 버전업(관리자 전용 좌석 포함)
 
     const generateSeats = (rows, cols) => {
       const seats = [];
       for (let r=1; r<=rows; r++) for (let c=1; c<=cols; c++) seats.push({ id:`R${r}-C${c}`, row:r, col:c });
       return seats;
     };
+
     const loadState = () => { try { const raw = localStorage.getItem(STORAGE_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; } };
     const saveState = (s) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch {} };
 
-    // 남은 시간 포맷
     const fmtRemain = (ms) => {
       if (ms <= 0) return "만료";
       const totalSec = Math.floor(ms/1000);
@@ -64,38 +67,46 @@
     function App() {
       const saved = loadState();
       const [config, setConfig] = useState(saved?.config || defaultConfig);
-      const [zoneMap, setZoneMap] = useState(saved?.zoneMap || {});
+      const [zoneMap, setZoneMap] = useState(saved?.zoneMap || {});                 // seatId -> A/B/C/U
+      const [adminOnlyMap, setAdminOnlyMap] = useState(saved?.adminOnlyMap || {});  // seatId -> true(관리자 전용)
       const [date, setDate] = useState(saved?.date || new Date().toISOString().slice(0,10));
-      const [reservations, setReservations] = useState(saved?.reservations || {});
+      const [reservations, setReservations] = useState(saved?.reservations || {});  // date -> seatId -> data
       const [selection, setSelection] = useState([]);
-      const [mode, setMode] = useState("reserve");
+      const [mode, setMode] = useState("reserve"); // reserve | assign
+      const [adminMode, setAdminMode] = useState(false);
       const [form, setForm] = useState({ name:"", phone:"", notes:"" });
-      const [tick, setTick] = useState(Date.now()); // 타이머 갱신
+      const [tick, setTick] = useState(Date.now()); // 타이머
 
       const seats = useMemo(()=>generateSeats(config.rows, config.cols), [config.rows, config.cols]);
-      useEffect(()=>saveState({config, zoneMap, date, reservations}), [config, zoneMap, date, reservations]);
+      useEffect(()=>saveState({config, zoneMap, date, reservations, adminOnlyMap}), [config, zoneMap, date, reservations, adminOnlyMap]);
 
-      // 1초 간격 카운트다운
-      useEffect(()=>{
-        const t = setInterval(()=>setTick(Date.now()), 1000);
-        return ()=>clearInterval(t);
-      }, []);
+      useEffect(()=>{ const t = setInterval(()=>setTick(Date.now()), 1000); return ()=>clearInterval(t); }, []);
 
       const dayBook = reservations[date] || {};
       const cycleZone = (z) => (z==="U"||!z) ? "A" : z==="A" ? "B" : z==="B" ? "C" : "U";
       const priceForSeat = (sid) => config.zones[zoneMap[sid] || "U"] || 0;
 
-      const toggleSelect = (sid) => {
+      const isAdminOnly = (sid) => Boolean(adminOnlyMap[sid]);
+      const toggleAdminOnly = (sid) => setAdminOnlyMap(prev => ({ ...prev, [sid]: !prev[sid] }));
+
+      const toggleSelect = (sid, evt) => {
+        // 구역지정 모드 + Shift: 관리자 전용 토글
+        if (mode === "assign" && evt?.shiftKey) { toggleAdminOnly(sid); return; }
+
+        // 관리자 전용 좌석은 일반 모드에서 선택 불가
+        if (isAdminOnly(sid) && !adminMode && mode !== "assign") return;
+
         if (mode === "assign") {
           setZoneMap(prev=>({ ...prev, [sid]: cycleZone(prev[sid] || "U") }));
           return;
         }
         setSelection(prev => prev.includes(sid) ? prev.filter(x=>x!==sid) : [...prev, sid]);
       };
+
       const clearSelection = () => setSelection([]);
       const totalSelected = useMemo(()=>selection.reduce((s,id)=>s+priceForSeat(id),0), [selection, zoneMap, config.zones]);
 
-      // 고객 안내문 만들기
+      // 고객 안내문
       const buildNotice = (sum, deposit, dueAtISO) => {
         const d = new Date(dueAtISO);
         const dueStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
@@ -133,15 +144,16 @@
               name: (form.name || "손님").trim(),
               phone: (form.phone || "").trim(),
               notes: (form.notes || "").trim(),
-              status: "입금대기",                // ← 핵심
+              status: "입금대기",
               total: sum,
               deposit,
               createdAt: stamp.toISOString(),
-              dueAt,                            // 입금 마감 시각
+              dueAt,
               bank: config.bank,
               account: config.account,
               holder: config.holder,
               depositRate: config.depositRate,
+              adminOnly: isAdminOnly(sid),
             };
           });
           copy[date] = d;
@@ -150,7 +162,7 @@
         clearSelection();
       };
 
-      // 상태 변경
+      // 상태 변경/취소/만료
       const updateStatus = (sid, next) => {
         setReservations(prev=>{
           const copy = {...prev};
@@ -169,8 +181,6 @@
           return copy;
         });
       };
-
-      // 만료 처리
       const markExpiredIfOverdue = (sid) => {
         setReservations(prev=>{
           const copy = {...prev};
@@ -189,9 +199,9 @@
       const exportCSV = () => {
         const dbook = reservations[date] || {};
         const rows = [
-          ["date","seat","zone","price","name","phone","status","total","deposit","createdAt","dueAt","bank","account","holder","notes"],
+          ["date","seat","zone","price","name","phone","status","total","deposit","createdAt","dueAt","bank","account","holder","adminOnly","notes"],
           ...Object.values(dbook).map(r=>[
-            date,r.id,r.zone,r.price,r.name,r.phone,r.status,r.total||"",r.deposit||"",r.createdAt||"",r.dueAt||"",r.bank||"",r.account||"",r.holder||"",r.notes||""
+            date,r.id,r.zone,r.price,r.name,r.phone,r.status,r.total||"",r.deposit||"",r.createdAt||"",r.dueAt||"",r.bank||"",r.account||"",r.holder||"",r.adminOnly?"Y":"",r.notes||""
           ])
         ];
         const csv = rows.map(r=>r.map(x=>`"${String(x??"").replaceAll('"','""')}"`).join(",")).join("\n");
@@ -201,16 +211,27 @@
         URL.revokeObjectURL(url);
       };
 
-      // UI
       return (
         <div className="p-4 md:p-8">
           <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* 헤더 */}
             <div className="lg:col-span-3 flex items-center justify-between">
               <div>
-                <h1 className="text-2xl md:text-3xl font-bold">좌석 예약 시스템 · 수동 확정</h1>
-                <p className="text-sm text-gray-600 mt-1">입금대기 → 입금확인(확정) · 기한 초과 시 만료 처리</p>
+                <h1 className="text-2xl md:text-3xl font-bold">좌석 예약 시스템</h1>
+                <p className="text-sm text-gray-600 mt-1">관리자 전용 좌석 + 수동 확정(계약금) · 로컬 저장 · CSV 내보내기</p>
               </div>
               <div className="flex gap-2">
+                <button
+                  className={"px-3 py-2 rounded-2xl shadow " + (adminMode ? "bg-emerald-600 text-white" : "bg-white hover:bg-gray-50")}
+                  onClick={()=>{
+                    if (adminMode) { setAdminMode(false); return; }
+                    const pin = prompt("관리자 PIN을 입력하세요");
+                    if (pin === config.adminPin) setAdminMode(true);
+                    else alert("PIN이 올바르지 않습니다.");
+                  }}
+                >
+                  {adminMode ? "관리자 모드 ON" : "관리자 모드"}
+                </button>
                 <button className="px-3 py-2 rounded-2xl shadow bg-white hover:bg-gray-50" onClick={exportCSV}>CSV 내보내기</button>
               </div>
             </div>
@@ -238,7 +259,7 @@
                     <label className="block text-xs text-gray-500">모드</label>
                     <select value={mode} onChange={(e)=>setMode(e.target.value)} className="mt-1 w-full rounded-xl border p-2">
                       <option value="reserve">좌석 예약</option>
-                      <option value="assign">구역 지정(클릭으로 순환)</option>
+                      <option value="assign">구역 지정(클릭 순환 / Shift=관리자전용)</option>
                     </select>
                   </div>
                 </div>
@@ -319,29 +340,39 @@
             <div className="lg:col-span-2 bg-white rounded-2xl shadow p-4">
               <div className="flex items-center justify-between mb-3">
                 <h2 className="font-semibold">좌석 배치</h2>
-                <div className="text-sm text-gray-600">클릭: {mode==="assign" ? "구역 순환(A→B→C→미지정)" : "좌석 선택/해제"}</div>
+                <div className="text-sm text-gray-600">
+                  클릭: {mode==="assign" ? "구역 순환(A→B→C→미지정), Shift+클릭: 관리자전용(🔒) 토글" : "좌석 선택/해제"}
+                </div>
               </div>
               <div className="grid" style={{ gridTemplateColumns: `repeat(${config.cols}, minmax(0, 1fr))`, gap: "8px" }}>
                 {seats.map(s=>{
                   const z = zoneMap[s.id] || "U";
                   const booked = Boolean(dayBook[s.id]);
                   const selected = selection.includes(s.id);
+                  const adminOnly = isAdminOnly(s.id);
                   return (
                     <button key={s.id}
-                      onClick={()=>{ if (booked && mode!=="assign") return; toggleSelect(s.id); }}
+                      onClick={(e)=>{ if (booked && mode!=="assign") return; toggleSelect(s.id, e); }}
                       className={[
                         "seat relative aspect-square rounded-xl border flex items-center justify-center text-xs md:text-sm select-none transition",
                         ZONE_COLORS[z],
                         (booked && mode!=="assign") ? "opacity-50 cursor-not-allowed" : "",
+                        (adminOnly && !adminMode && mode!=="assign") ? "opacity-50 cursor-not-allowed" : "",
                         selected ? "ring-2 ring-emerald-500" : ""
                       ].join(" ")}
-                      title={`${s.id} · 구역 ${z}${booked ? " · 예약됨" : ""}`}
+                      title={`${s.id} · 구역 ${z}${booked ? " · 예약됨" : ""}${adminOnly ? " · 관리자전용" : ""}`}
                     >
                       <div className="text-gray-800 font-medium">{s.id}</div>
                       <div className="absolute bottom-1 right-1 text-[10px] bg-white/70 px-1 rounded">
                         {priceForSeat(s.id).toLocaleString()}원
                       </div>
-                      {booked && mode!=="assign" && <div className="absolute inset-0 rounded-xl bg-black/10"></div>}
+
+                      {/* 관리자 전용 배지 */}
+                      {adminOnly && (
+                        <div className="absolute top-1 left-1 text-[10px] bg-gray-800 text-white px-1 rounded">🔒</div>
+                      )}
+
+                      {(booked && mode!=="assign") && <div className="absolute inset-0 rounded-xl bg-black/10"></div>}
                     </button>
                   );
                 })}
@@ -370,12 +401,13 @@
                         <th className="text-left p-2">마감</th>
                         <th className="text-left p-2">남은 시간</th>
                         <th className="text-left p-2">메모</th>
+                        <th className="text-left p-2">관리자전용</th>
                         <th className="text-right p-2">작업</th>
                       </tr>
                     </thead>
                     <tbody>
                       {Object.values(dayBook).length === 0 && (
-                        <tr><td colSpan="11" className="p-6 text-center text-gray-500">아직 예약이 없습니다.</td></tr>
+                        <tr><td colSpan="12" className="p-6 text-center text-gray-500">아직 예약이 없습니다.</td></tr>
                       )}
                       {Object.values(dayBook).sort((a,b)=>a.id.localeCompare(b.id)).map((r)=>{
                         const dueMs = r.dueAt ? new Date(r.dueAt).getTime() - tick : 0;
@@ -401,6 +433,7 @@
                             <td className="p-2">{r.dueAt ? new Date(r.dueAt).toLocaleString() : "-"}</td>
                             <td className="p-2">{remain}</td>
                             <td className="p-2 max-w-[220px] truncate" title={r.notes}>{r.notes}</td>
+                            <td className="p-2">{r.adminOnly ? "🔒" : "-"}</td>
                             <td className="p-2">
                               <div className="flex flex-col gap-1 items-end">
                                 {r.status==="입금대기" && (
@@ -435,17 +468,17 @@
                   <h3 className="font-semibold mb-2">운영 흐름</h3>
                   <ol className="list-decimal pl-5 space-y-1 text-sm text-gray-700">
                     <li>좌석 구역 지정(A/B/C) 및 가격 입력</li>
-                    <li>날짜 선택 → 좌석 선택 → 예약자 정보 입력 → <b>입금대기 생성</b></li>
-                    <li>고객 입금 확인 후 <b>입금확인→확정</b> 클릭</li>
-                    <li>기한 경과 시 <b>만료 처리</b> 클릭(또는 수동 취소)</li>
+                    <li>관리자 전용 좌석: <b>모드=구역 지정</b>에서 <b>Shift+클릭</b>으로 토글(🔒)</li>
+                    <li>날짜 선택 → 좌석 선택 → 예약자 정보 → <b>입금대기 생성</b></li>
+                    <li>입금 확인 후 <b>입금확인→확정</b>, 기한 경과 시 <b>만료 처리</b></li>
                   </ol>
                 </div>
                 <div className="bg-white rounded-2xl shadow p-4">
                   <h3 className="font-semibold mb-2">팁</h3>
                   <ul className="list-disc pl-5 space-y-1 text-sm text-gray-700">
-                    <li>계약금·기한·계좌는 좌측 패널에서 변경 가능합니다.</li>
-                    <li><b>안내문 복사</b> 버튼으로 금액/계좌/기한 포함 메시지를 빠르게 전송하세요.</li>
-                    <li>데이터는 브라우저에 저장됩니다. PC 변경 시 CSV 백업 권장.</li>
+                    <li><b>관리자 모드</b> 버튼으로 PIN 입력 후 관리자 전용 좌석도 예약 가능</li>
+                    <li>안내문 복사: 금액·계좌·기한 포함 메시지를 바로 고객에게 전송</li>
+                    <li>데이터는 브라우저에 저장됩니다. PC 변경 시 CSV 백업 권장</li>
                   </ul>
                 </div>
               </div>
