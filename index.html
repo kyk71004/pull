@@ -3,18 +3,23 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>좌석 예약 시스템 · 로그인/서버연동 + PIN (안정화)</title>
+  <title>좌석 예약 시스템 · 로그인/서버연동 + PIN (안정화·진단강화)</title>
+
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
+
   <!-- React / ReactDOM -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
   <!-- Babel (in-browser JSX) -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <!-- Firebase (compat APIs) -->
+
+  <!-- Firebase (compat APIs: 반드시 이 3개가 먼저 로드되어야 합니다) -->
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+
   <style>
     .seat:hover { transform: scale(1.03); }
     .floating-bar { position: fixed; left: 50%; transform: translateX(-50%); bottom: 16px; transition: transform .25s, opacity .25s; }
@@ -29,7 +34,9 @@
   <script type="text/babel">
     const { useEffect, useMemo, useState } = React;
 
-    // === Firebase 설정 (역장님 프로젝트 값) ===
+    // =========================
+    // 1) Firebase 설정 (역장님 프로젝트 값)
+    // =========================
     const firebaseConfig = {
       apiKey: "AIzaSyDwbhaCMsn0YN63Wwgu3VkS9YfpBxLhCYg",
       authDomain: "pull2-82a3d.firebaseapp.com",
@@ -40,20 +47,24 @@
       measurementId: "G-RLQBJ02FCY",
     };
 
-    // --- Robust Firebase init (안정화 패치) ---
+    // =========================
+    // 2) Robust Firebase init (안정화 패치)
+    // =========================
     let app, auth, db;
     try {
       if (!firebase.apps.length) app = firebase.initializeApp(firebaseConfig);
       else app = firebase.app();
       auth = firebase.auth();
-      db = firebase.firestore();
+      db   = firebase.firestore();
       // 새로고침/탭 전환에도 로그인 유지
       auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(console.error);
     } catch (e) {
       console.error("Firebase init error:", e);
     }
 
-    // ---- 기본 설정 ----
+    // =========================
+    // 3) 앱 기본 설정/유틸
+    // =========================
     const ZONE_COLORS = { A: "bg-green-200 border-green-500", B: "bg-blue-200 border-blue-500", C: "bg-amber-200 border-amber-500", U: "bg-gray-200 border-gray-400" };
     const defaultConfig = {
       rows: 6, cols: 10,
@@ -73,21 +84,29 @@
 
     function App(){
       const local = loadLocal();
-      const [config, setConfig] = useState(local?.config || defaultConfig);
-      const [zoneMap, setZoneMap] = useState(local?.zoneMap || {});               // seatId -> A/B/C/U
-      const [adminOnlyMap, setAdminOnlyMap] = useState(local?.adminOnlyMap || {});// seatId -> true
-      const [date, setDate] = useState(local?.date || new Date().toISOString().slice(0,10));
-      const [reservations, setReservations] = useState(local?.reservations || {});// date -> seatId -> data
-      const [selection, setSelection] = useState([]);
-      const [mode, setMode] = useState("reserve"); // reserve | assign
-      const [adminMode, setAdminMode] = useState(false);
-      const [form, setForm] = useState({ name:"", phone:"", notes:"" });
-      const [tick, setTick] = useState(Date.now());
-      const [user, setUser] = useState(null);
+      const [config, setConfig]               = useState(local?.config || defaultConfig);
+      const [zoneMap, setZoneMap]             = useState(local?.zoneMap || {});                // seatId -> A/B/C/U
+      const [adminOnlyMap, setAdminOnlyMap]   = useState(local?.adminOnlyMap || {});           // seatId -> true
+      const [date, setDate]                   = useState(local?.date || new Date().toISOString().slice(0,10));
+      const [reservations, setReservations]   = useState(local?.reservations || {});           // date -> seatId -> data
+      const [selection, setSelection]         = useState([]);
+      const [mode, setMode]                   = useState("reserve"); // reserve | assign
+      const [adminMode, setAdminMode]         = useState(false);
+      const [form, setForm]                   = useState({ name:"", phone:"", notes:"" });
+      const [tick, setTick]                   = useState(Date.now());
+      const [user, setUser]                   = useState(null);
 
-      // 온라인 여부는 실제 SDK 초기화 기준으로 1회 계산
+      // 🔒 온라인 준비여부(진단강화): SDK가 늦게 붙는 케이스까지 커버
       const [online, setOnline] = useState(false);
-      useEffect(()=>{ setOnline(!!auth && !!db); }, []);
+      useEffect(() => {
+        let tries = 0;
+        const t = setInterval(() => {
+          const ready = !!(window.firebase && auth && db && firebase.apps?.length);
+          setOnline(ready);
+          if (ready || ++tries > 20) clearInterval(t); // 최대 2초 폴링
+        }, 100);
+        return () => clearInterval(t);
+      }, []);
 
       const seats = useMemo(()=>generateSeats(config.rows, config.cols), [config.rows, config.cols]);
       useEffect(()=>saveLocal({config, zoneMap, adminOnlyMap, date, reservations}), [config, zoneMap, adminOnlyMap, date, reservations]);
