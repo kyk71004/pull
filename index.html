@@ -32,11 +32,14 @@
     // ---- Firebase Config (필수: 본인 프로젝트 값으로 교체) ----
     // Firebase 콘솔 → 프로젝트 설정 → 내 앱 → SDK 설정 및 구성 복사
     const firebaseConfig = {
-      apiKey: "YOUR_API_KEY",
-      authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
-      projectId: "YOUR_PROJECT_ID",
-      // (선택) appId, storageBucket 등 필요시 추가
-    };
+  apiKey: "AIzaSyDwbhaCMsn0YN63Wwgu3VkS9YfpBxLhCYg",
+  authDomain: "pull2-82a3d.firebaseapp.com",
+  projectId: "pull2-82a3d",
+  storageBucket: "pull2-82a3d.firebasestorage.app",
+  messagingSenderId: "645984634527",
+  appId: "1:645984634527:web:d954aec822c91c13d584aa",
+  measurementId: "G-RLQBJ02FCY",
+};
     const FIREBASE_READY = firebaseConfig.apiKey && !/YOUR_API_KEY/.test(firebaseConfig.apiKey);
 
     let app = null, auth = null, db = null;
