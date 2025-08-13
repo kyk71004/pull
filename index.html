@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>좌석 예약 시스템 · 로그인/서버연동 + PIN (안정화·진단강화)</title>
+  <title>좌석 예약 시스템 · 로그인/서버연동 + PIN (모바일 안정화)</title>
 
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -15,7 +15,7 @@
   <!-- Babel (in-browser JSX) -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  <!-- Firebase (compat APIs: 반드시 이 3개가 먼저 로드되어야 합니다) -->
+  <!-- Firebase (compat APIs: 반드시 이 3개가 먼저 로드) -->
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
@@ -48,7 +48,7 @@
     };
 
     // =========================
-    // 2) Robust Firebase init (안정화 패치)
+    // 2) Robust Firebase init (안정화)
     // =========================
     let app, auth, db;
     try {
@@ -113,11 +113,11 @@
       useEffect(()=>{ const t=setInterval(()=>setTick(Date.now()),1000); return ()=>clearInterval(t); },[]);
 
       // Auth 상태 구독
-      useEffect(()=>{ if (!online || !auth) return; const unsub = auth.onAuthStateChanged(u=>setUser(u)); return ()=>unsub&&unsub(); }, [online]);
+      useEffect(()=>{ if (!auth) return; const unsub = auth.onAuthStateChanged(u=>setUser(u)); return ()=>unsub&&unsub(); }, []);
 
       // 날짜/venue 변경 시 실시간 리스너
       useEffect(()=>{
-        if (!online || !db || !user) return;
+        if (!db || !user) return;
         const path = db.collection('venues').doc(config.venueId).collection('dates').doc(date).collection('reservations');
         const unsub = path.onSnapshot(
           (snap) => {
@@ -130,7 +130,7 @@
           }
         );
         return ()=>unsub&&unsub();
-      }, [online, user, db, config.venueId, date]);
+      }, [user, db, config.venueId, date]);
 
       const dayBook = reservations[date] || {};
       const cycleZone = (z) => (z==="U"||!z) ? "A" : z==="A" ? "B" : z==="B" ? "C" : "U";
@@ -151,11 +151,11 @@
       const buildReservationPayload = (sid, stamp) => {
         const sum = totalSelected;
         const deposit = Math.round(sum * (config.depositRate/100));
-        const dueAt = new Date(stamp.getTime() + config.depositDeadlineH*3600*1000).toISOString();
+        theDue = new Date(stamp.getTime() + config.depositDeadlineH*3600*1000).toISOString();
         return {
           id: sid, zone: zoneMap[sid] || "U", price: priceForSeat(sid),
           name: (form.name||"손님").trim(), phone: (form.phone||"").trim(), notes: (form.notes||"").trim(),
-          status: "입금대기", total: sum, deposit, createdAt: stamp.toISOString(), dueAt,
+          status: "입금대기", total: sum, deposit, createdAt: stamp.toISOString(), dueAt: theDue,
           bank: config.bank, account: config.account, holder: config.holder, depositRate: config.depositRate,
           adminOnly: isAdminOnly(sid),
           by: user ? (user.email || user.uid) : "local"
@@ -166,7 +166,7 @@
       const createPending = async () => {
         if (selection.length===0) return;
         const stamp = new Date();
-        if (online && db && user){
+        if (db && user){
           const col = db.collection('venues').doc(config.venueId).collection('dates').doc(date).collection('reservations');
           const batch = db.batch();
           selection.forEach(sid => batch.set(col.doc(sid), buildReservationPayload(sid, stamp), { merge:false }));
@@ -178,7 +178,7 @@
       };
 
       const updateStatus = async (sid, next) => {
-        if (online && db && user){
+        if (db && user){
           const ref = db.collection('venues').doc(config.venueId).collection('dates').doc(date).collection('reservations').doc(sid);
           await ref.set({ status: next }, { merge:true }).catch(err=>alert("업데이트 오류: "+err.message));
         } else {
@@ -187,7 +187,7 @@
       };
 
       const cancelSeat = async (sid) => {
-        if (online && db && user){
+        if (db && user){
           const ref = db.collection('venues').doc(config.venueId).collection('dates').doc(date).collection('reservations').doc(sid);
           await ref.delete().catch(err=>alert("삭제 오류: "+err.message));
         } else {
@@ -214,13 +214,13 @@
       };
 
       const saveConfigToServer = async () => {
-        if (!online || !db || !user) return alert("로그인 후 이용하세요.");
+        if (!db || !user) return alert("로그인 후 이용하세요.");
         const ref = db.collection('venues').doc(config.venueId).collection('config').doc('default');
         await ref.set({ ...config, zoneMap, adminOnlyMap, updatedAt:new Date().toISOString(), by:user.email||user.uid }, { merge:true })
                  .then(()=>alert("설정 저장 완료")).catch(err=>alert("설정 저장 오류: "+err.message));
       };
       const loadConfigFromServer = async () => {
-        if (!online || !db || !user) return alert("로그인 후 이용하세요.");
+        if (!db || !user) return alert("로그인 후 이용하세요.");
         const ref = db.collection('venues').doc(config.venueId).collection('config').doc('default');
         const snap = await ref.get();
         if (!snap.exists) return alert("서버에 저장된 설정이 없습니다.");
@@ -260,32 +260,28 @@
               </div>
             </div>
 
-            {/* 로그인/프로젝트 설정 바 */}
+            {/* 로그인/프로젝트 설정 바 (항상 폼 보이기) */}
             <div className="lg:col-span-3 bg-white rounded-2xl shadow p-4 flex flex-wrap items-end gap-3">
               <div>
                 <div className="text-xs text-gray-500">지점/공간 ID (venueId)</div>
                 <input className="border rounded-xl p-2 mono" value={config.venueId} onChange={(e)=>setConfig(c=>({...c, venueId: e.target.value || "main"}))} />
               </div>
 
-{/* 항상 로그인 폼을 보여주고, 로그인되면 오른쪽에 상태만 표시 */}
-<div className="flex items-end gap-3">
-  {user ? (
-    <>
-      <div className="text-sm">로그인: <b>{user.email || user.uid}</b></div>
-      <button className="px-3 py-2 rounded-xl bg-white border" onClick={()=>auth.signOut()}>로그아웃</button>
-    </>
-  ) : (
-    <AuthForm />
-  )}
-
-  {/* 연결 상태는 안내만 (폼은 숨기지 않음) */}
-  {!online && (
-    <span className="text-xs px-2 py-1 rounded border bg-yellow-50 text-yellow-700">
-      Firebase 연결 대기…(입력 가능)
-    </span>
-  )}
-</div>
-
+              <div className="flex items-end gap-3">
+                {user ? (
+                  <>
+                    <div className="text-sm">로그인: <b>{user.email||user.uid}</b></div>
+                    <button className="px-3 py-2 rounded-xl bg-white border" onClick={()=>auth.signOut()}>로그아웃</button>
+                  </>
+                ) : (
+                  <AuthForm />
+                )}
+                {!online && (
+                  <span className="text-xs px-2 py-1 rounded border bg-yellow-50 text-yellow-700">
+                    Firebase 연결 대기… (입력 가능)
+                  </span>
+                )}
+              </div>
 
               <div className="ml-auto flex gap-2">
                 <button className="px-3 py-2 rounded-xl bg-white border" onClick={loadConfigFromServer}>설정 불러오기</button>
@@ -517,22 +513,46 @@
         </div>
       );
 
+      // ===== 로그인 폼(항상 표시, 모바일 입력 유지) =====
       function AuthForm(){
-        const [email, setEmail] = useState("");
-        const [pw, setPw] = useState("");
-        if (!auth) return null;
+        const [email, setEmail] = React.useState(localStorage.getItem("auth_email") || "");
+        const [pw, setPw]       = React.useState("");
+        React.useEffect(()=>{ localStorage.setItem("auth_email", email); }, [email]);
+        const disabled = !auth; // Firebase 준비 전에도 폼은 보이되 버튼만 비활성
+
         return (
           <div className="flex items-end gap-2">
             <div>
               <div className="text-xs text-gray-500">이메일</div>
-              <input className="border rounded-xl p-2" value={email} onChange={e=>setEmail(e.target.value)} placeholder="staff@example.com" />
+              <input
+                className="border rounded-xl p-2"
+                value={email}
+                onChange={e=>setEmail(e.target.value)}
+                placeholder="staff@example.com"
+                inputMode="email"
+                autoComplete="username"
+              />
             </div>
             <div>
               <div className="text-xs text-gray-500">비밀번호</div>
-              <input type="password" className="border rounded-xl p-2" value={pw} onChange={e=>setPw(e.target.value)} />
+              <input
+                type="password"
+                className="border rounded-xl p-2"
+                value={pw}
+                onChange={e=>setPw(e.target.value)}
+                autoComplete="current-password"
+              />
             </div>
-            <button className="px-3 py-2 rounded-xl bg-white border" onClick={()=>auth.signInWithEmailAndPassword(email, pw).catch(e=>alert(e.message))}>로그인</button>
-            <button className="px-3 py-2 rounded-xl bg-white border" onClick={()=>auth.createUserWithEmailAndPassword(email, pw).catch(e=>alert(e.message))}>회원가입</button>
+            <button
+              className="px-3 py-2 rounded-xl bg-white border"
+              onClick={()=>auth.signInWithEmailAndPassword(email, pw).catch(e=>alert(e.message))}
+              disabled={disabled}
+            >로그인</button>
+            <button
+              className="px-3 py-2 rounded-xl bg-white border"
+              onClick={()=>auth.createUserWithEmailAndPassword(email, pw).catch(e=>alert(e.message))}
+              disabled={disabled}
+            >회원가입</button>
           </div>
         );
       }
