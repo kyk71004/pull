@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>좌석 예약 시스템 · 로그인/서버연동 + PIN (모바일 안정화)</title>
+  <title>좌석 예약 시스템 · 로그인/서버연동 + PIN (모바일 로그인 고정)</title>
 
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -34,6 +34,9 @@
   <script type="text/babel">
     const { useEffect, useMemo, useState } = React;
 
+    // URL 파라미터: 로그인 전용 모드 (?auth=1)
+    const FORCE_AUTH = new URLSearchParams(location.search).get('auth') === '1';
+
     // =========================
     // 1) Firebase 설정 (역장님 프로젝트 값)
     // =========================
@@ -48,7 +51,7 @@
     };
 
     // =========================
-    // 2) Robust Firebase init (안정화)
+    // 2) Robust Firebase init
     // =========================
     let app, auth, db;
     try {
@@ -60,6 +63,73 @@
       auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(console.error);
     } catch (e) {
       console.error("Firebase init error:", e);
+    }
+
+    // ===== 로그인 폼(항상 표시, 모바일 입력 유지) =====
+    function AuthForm(){
+      const [email, setEmail] = React.useState(localStorage.getItem("auth_email") || "");
+      const [pw, setPw]       = React.useState("");
+      React.useEffect(()=>{ localStorage.setItem("auth_email", email); }, [email]);
+      const disabled = !auth; // SDK 준비 전에도 폼은 보이되 버튼만 비활성
+
+      return (
+        <div className="flex items-end gap-2 w-full sm:w-auto">
+          <div className="min-w-[180px]">
+            <div className="text-xs text-gray-500">이메일</div>
+            <input
+              className="border rounded-xl p-2 w-full"
+              value={email}
+              onChange={e=>setEmail(e.target.value)}
+              placeholder="staff@example.com"
+              inputMode="email"
+              autoComplete="username"
+            />
+          </div>
+          <div className="min-w-[140px]">
+            <div className="text-xs text-gray-500">비밀번호</div>
+            <input
+              type="password"
+              className="border rounded-xl p-2 w-full"
+              value={pw}
+              onChange={e=>setPw(e.target.value)}
+              autoComplete="current-password"
+            />
+          </div>
+          <button
+            className="px-3 py-2 rounded-xl bg-white border"
+            onClick={()=>auth.signInWithEmailAndPassword(email, pw).catch(e=>alert(e.message))}
+            disabled={disabled}
+          >로그인</button>
+          <button
+            className="px-3 py-2 rounded-xl bg-white border"
+            onClick={()=>auth.createUserWithEmailAndPassword(email, pw).catch(e=>alert(e.message))}
+            disabled={disabled}
+          >회원가입</button>
+        </div>
+      );
+    }
+
+    // ===== 로그인 전용 화면 (모바일에서 안전) =====
+    function OnlyAuth(){
+      const [user, setUser] = useState(null);
+      useEffect(()=> auth && auth.onAuthStateChanged(setUser), []);
+      return (
+        <div className="min-h-screen flex flex-col items-center justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl shadow p-4 sticky top-0 z-50">
+            <h1 className="text-xl font-bold mb-2">로그인</h1>
+            <p className="text-xs text-gray-600 mb-3">
+              폼이 사라지지 않는 전용 화면입니다. 로그인 완료 후 주소의 <b>?auth=1</b>를 지우고 사용하세요.
+            </p>
+            <AuthForm />
+            <div className="mt-3 text-sm text-gray-600">
+              상태: {user ? <b>로그인됨 · {user.email||user.uid}</b> : "로그아웃"}
+            </div>
+          </div>
+          <div className="max-w-md text-xs text-gray-500 mt-4 text-center">
+            문제가 지속되면 브라우저 메뉴에서 <b>데스크톱 사이트 요청</b>을 켠 뒤 다시 시도해 보세요.
+          </div>
+        </div>
+      );
     }
 
     // =========================
@@ -83,6 +153,8 @@
     const saveLocal = (x) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(x)); } catch {} };
 
     function App(){
+      if (FORCE_AUTH) return <OnlyAuth />; // 🔒 모바일 로그인 전용 모드
+
       const local = loadLocal();
       const [config, setConfig]               = useState(local?.config || defaultConfig);
       const [zoneMap, setZoneMap]             = useState(local?.zoneMap || {});                // seatId -> A/B/C/U
@@ -96,7 +168,7 @@
       const [tick, setTick]                   = useState(Date.now());
       const [user, setUser]                   = useState(null);
 
-      // 🔒 온라인 준비여부(진단강화): SDK가 늦게 붙는 케이스까지 커버
+      // 온라인 준비여부(진단강화)
       const [online, setOnline] = useState(false);
       useEffect(() => {
         let tries = 0;
@@ -151,11 +223,11 @@
       const buildReservationPayload = (sid, stamp) => {
         const sum = totalSelected;
         const deposit = Math.round(sum * (config.depositRate/100));
-        theDue = new Date(stamp.getTime() + config.depositDeadlineH*3600*1000).toISOString();
+        const dueAt = new Date(stamp.getTime() + config.depositDeadlineH*3600*1000).toISOString();
         return {
           id: sid, zone: zoneMap[sid] || "U", price: priceForSeat(sid),
           name: (form.name||"손님").trim(), phone: (form.phone||"").trim(), notes: (form.notes||"").trim(),
-          status: "입금대기", total: sum, deposit, createdAt: stamp.toISOString(), dueAt: theDue,
+          status: "입금대기", total: sum, deposit, createdAt: stamp.toISOString(), dueAt,
           bank: config.bank, account: config.account, holder: config.holder, depositRate: config.depositRate,
           adminOnly: isAdminOnly(sid),
           by: user ? (user.email || user.uid) : "local"
@@ -260,14 +332,14 @@
               </div>
             </div>
 
-            {/* 로그인/프로젝트 설정 바 (항상 폼 보이기) */}
-            <div className="lg:col-span-3 bg-white rounded-2xl shadow p-4 flex flex-wrap items-end gap-3">
+            {/* 로그인/프로젝트 설정 바 (항상 폼 보이기 + 스티키 고정) */}
+            <div className="lg:col-span-3 bg-white rounded-2xl shadow p-4 flex flex-wrap items-end gap-3 sticky top-0 z-40">
               <div>
                 <div className="text-xs text-gray-500">지점/공간 ID (venueId)</div>
                 <input className="border rounded-xl p-2 mono" value={config.venueId} onChange={(e)=>setConfig(c=>({...c, venueId: e.target.value || "main"}))} />
               </div>
 
-              <div className="flex items-end gap-3">
+              <div className="flex items-end gap-3 flex-1 min-w-[260px]">
                 {user ? (
                   <>
                     <div className="text-sm">로그인: <b>{user.email||user.uid}</b></div>
@@ -465,101 +537,3 @@
                                     <button className="px-2 py-1 rounded-xl bg-white border" onClick={()=>markExpiredIfOverdue(r.id)}>만료 처리</button>
                                     <button className="px-2 py-1 rounded-xl bg-white border" onClick={()=>copyText(buildNotice(r.total||0, r.deposit||0, r.dueAt))}>안내문 복사</button>
                                   </>
-                                )}
-                                {r.status!=="취소" && (
-                                  <button className="px-2 py-1 rounded-xl bg-white border text-red-600" onClick={()=>updateStatus(r.id,"취소")}>취소</button>
-                                )}
-                                <button className="px-2 py-1 rounded-xl bg-white border" onClick={()=>cancelSeat(r.id)}>행 제거</button>
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              {/* 가이드 */}
-              <div className="mt-4 grid md:grid-cols-2 gap-4">
-                <div className="bg-white rounded-2xl shadow p-4">
-                  <h3 className="font-semibold mb-2">운영 흐름</h3>
-                  <ol className="list-decimal pl-5 space-y-1 text-sm text-gray-700">
-                    <li>로그인(이메일/비번) → venueId 확인</li>
-                    <li>좌석 구역(A/B/C) 지정 + 가격 입력</li>
-                    <li>관리자전용 좌석: <b>모드=구역 지정</b>에서 <b>Shift+클릭</b>으로 토글(🔒)</li>
-                    <li>날짜 선택 → 좌석 선택 → 예약자 정보 → <b>입금대기 생성</b></li>
-                    <li>입금 확인 후 <b>입금확인→확정</b>, 기한 경과 시 <b>만료 처리</b></li>
-                  </ol>
-                </div>
-                <div className="bg-white rounded-2xl shadow p-4">
-                  <h3 className="font-semibold mb-2">참고</h3>
-                  <ul className="list-disc pl-5 space-y-1 text-sm text-gray-700">
-                    <li>Firebase 미설정 시 로컬 모드로 동작(데이터는 이 PC 브라우저에 저장)</li>
-                    <li>설정을 서버에 저장/불러오기로 스태프 간 공유 가능</li>
-                    <li>중복 방지 강화를 위해 예약 생성 시 트랜잭션 적용을 권장(필요 시 확장)</li>
-                  </ul>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* 하단 선택 바 */}
-          <div className={"floating-bar bg-white shadow-lg rounded-2xl px-4 py-3 flex items-center gap-4 border "+(selection.length>0?"floating-enter-show":"floating-enter")}>
-            <div className="text-sm">선택 {selection.length}석 · 합계 <b>{totalSelected.toLocaleString()}</b>원</div>
-            <button onClick={createPending} className="px-3 py-2 rounded-xl bg-amber-500 text-white">입금대기 생성</button>
-            <button onClick={clearSelection} className="px-3 py-2 rounded-xl bg-white border">선택 해제</button>
-          </div>
-        </div>
-      );
-
-      // ===== 로그인 폼(항상 표시, 모바일 입력 유지) =====
-      function AuthForm(){
-        const [email, setEmail] = React.useState(localStorage.getItem("auth_email") || "");
-        const [pw, setPw]       = React.useState("");
-        React.useEffect(()=>{ localStorage.setItem("auth_email", email); }, [email]);
-        const disabled = !auth; // Firebase 준비 전에도 폼은 보이되 버튼만 비활성
-
-        return (
-          <div className="flex items-end gap-2">
-            <div>
-              <div className="text-xs text-gray-500">이메일</div>
-              <input
-                className="border rounded-xl p-2"
-                value={email}
-                onChange={e=>setEmail(e.target.value)}
-                placeholder="staff@example.com"
-                inputMode="email"
-                autoComplete="username"
-              />
-            </div>
-            <div>
-              <div className="text-xs text-gray-500">비밀번호</div>
-              <input
-                type="password"
-                className="border rounded-xl p-2"
-                value={pw}
-                onChange={e=>setPw(e.target.value)}
-                autoComplete="current-password"
-              />
-            </div>
-            <button
-              className="px-3 py-2 rounded-xl bg-white border"
-              onClick={()=>auth.signInWithEmailAndPassword(email, pw).catch(e=>alert(e.message))}
-              disabled={disabled}
-            >로그인</button>
-            <button
-              className="px-3 py-2 rounded-xl bg-white border"
-              onClick={()=>auth.createUserWithEmailAndPassword(email, pw).catch(e=>alert(e.message))}
-              disabled={disabled}
-            >회원가입</button>
-          </div>
-        );
-      }
-    }
-
-    const root = ReactDOM.createRoot(document.getElementById("root"));
-    root.render(<App />);
-  </script>
-</body>
-</html>
